@@ -1,0 +1,560 @@
+# DATA DOWNLOAD 1-375
+# DROUGHT RISK MAP DEVELOPMENT 375-560
+
+import os
+import zipfile
+import warnings
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import cartopy.io.shapereader as shpreader
+import cdsapi
+
+warnings.filterwarnings('ignore')
+
+# ── Shared spatial domain ────────────────────────────────────────────
+DOMAIN_LAT_MIN, DOMAIN_LAT_MAX = -12, 12
+DOMAIN_LON_MIN, DOMAIN_LON_MAX = 95, 156
+
+PROJECT_ROOT = #fill with individual project path. 
+PAM_SAVE_DIR = PROJECT_ROOT + '/ecmwf/51'
+os.makedirs(PAM_SAVE_DIR, exist_ok=True)
+
+plot_path = PAM_SAVE_DIR + '/plots'
+os.makedirs(plot_path, exist_ok=True)
+
+# Reads url/key from ~/.cdsapirc automatically
+c_cds = cdsapi.Client()
+
+# Section 1 — VHI download (NOAA)
+
+VHI_BASE_URL  = 'https://ftp.cpc.ncep.noaa.gov/precip/PORT/SEMDP/VEGETATION-INDEX/VHI/DATA/'
+VHI_YEARS     =  # ← change year(s) as needed
+VHI_FILE_FILTER = '0.10deg-MON'
+VHI_SAVE_DIR  = PROJECT_ROOT + '/RiskMap/VHI'
+os.makedirs(VHI_SAVE_DIR, exist_ok=True)
+
+print(f'VHI years to check: {VHI_YEARS}')
+print(f'VHI save directory: {VHI_SAVE_DIR}')
+
+def vhi_download_file(url, save_path):
+    if os.path.exists(save_path):
+        print(f'  Already exists, skipping: {os.path.basename(save_path)}')
+        return
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f'  Downloaded: {os.path.basename(save_path)}')
+    else:
+        print(f'  FAILED (status {response.status_code}): {url}')
+
+def vhi_get_nc_links(year_url, file_filter):
+    response = requests.get(year_url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    return [
+        year_url.rstrip('/') + '/' + a['href']
+        for a in soup.find_all('a', href=True)
+        if a['href'].endswith('.nc') and file_filter in a['href']
+    ]
+
+vhi_total = 0
+for vhi_year in VHI_YEARS:
+    vhi_year_url = VHI_BASE_URL + str(vhi_year) + '/'
+    print(f'\nChecking VHI year {vhi_year}: {vhi_year_url}')
+    vhi_links = vhi_get_nc_links(vhi_year_url, VHI_FILE_FILTER)
+    print(f'  Found {len(vhi_links)} matching files')
+    for url in vhi_links:
+        filename  = url.split('/')[-1]
+        save_path = os.path.join(VHI_SAVE_DIR, filename)
+        vhi_download_file(url, save_path)
+        vhi_total += 1
+
+print(f'\nVHI done — {vhi_total} files processed.')
+
+# Section 2 - SPEI download
+
+SPEI_DATASET  = 'derived-drought-historical-monthly'
+SPEI_ACCUM    = '3'           # '1' or '3' month accumulation
+SPEI_YEARS    = ['#']      # ← change as needed
+SPEI_MONTHS   = ['#']        # ← change as needed
+SPEI_SAVE_DIR = PROJECT_ROOT + '/RiskMap/SPEI'
+os.makedirs(SPEI_SAVE_DIR, exist_ok=True)
+
+print(f'SPEI accumulation: {SPEI_ACCUM}-month')
+print(f'SPEI targets: {[(y, m) for y in SPEI_YEARS for m in SPEI_MONTHS]}')
+
+for spei_year in SPEI_YEARS:
+    for spei_month in SPEI_MONTHS:
+        spei_final_nc = os.path.join(
+            SPEI_SAVE_DIR,
+            f'SPEI{SPEI_ACCUM}_genlogistic_global_era5t_moda_ref1991to2020_{spei_year}{spei_month}.area-subset.12.156.-12.95.nc' #name of SPEI file. 
+        )
+        if os.path.exists(spei_final_nc):
+            print(f'Already exists, skipping: {spei_final_nc}')
+            continue
+
+        print(f'Downloading SPEI: {spei_year}/{spei_month}...')
+        spei_zip_path = os.path.join(SPEI_SAVE_DIR, f'spei{SPEI_ACCUM}_{spei_year}{spei_month}.zip')
+        c_cds.retrieve(
+            SPEI_DATASET,
+            {
+                'variable': ['standardised_precipitation_evapotranspiration_index'],
+                'accumulation_period': [SPEI_ACCUM],
+                'version': '1_0',
+                'product_type': 'reanalysis',
+                'dataset_type': 'consolidated_dataset',
+                'year': [spei_year],
+                'month': [spei_month],
+                'area': [DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LAT_MIN, DOMAIN_LON_MAX],
+            },
+            spei_zip_path,
+        )
+        with zipfile.ZipFile(spei_zip_path, 'r') as z:
+            z.extractall(SPEI_SAVE_DIR)
+        os.remove(spei_zip_path)
+        print(f'Downloaded and extracted: {spei_final_nc}')
+
+print('\nSPEI done!')
+
+# Section 3 - PAM precipitation download and transformation 
+
+PAM_DATASET           = 'seasonal-monthly-single-levels'
+HC_ORIGINATING_CENTRE = 'ecmwf'
+HC_SYSTEM             = '51'
+HC_CLIMATOLOGY_YEARS  = [str(y) for y in range(1993, 2017)]
+HC_MONTHS             = ['#']   # ← add whichever init months you need
+
+print(f'Hindcast climatology: {HC_CLIMATOLOGY_YEARS[0]}–{HC_CLIMATOLOGY_YEARS[-1]}')
+print(f'Hindcast init months: {HC_MONTHS}')
+
+for hc_month in HC_MONTHS:
+    hc_file = PAM_SAVE_DIR + f'/hc_{HC_ORIGINATING_CENTRE}_{HC_SYSTEM}_1993_2016_{hc_month}.grib'
+    if os.path.exists(hc_file):
+        print(f'HC already exists, skipping: {hc_file}')
+        continue
+    print(f'Downloading hindcast for month {hc_month}...')
+    c_cds.retrieve(
+        PAM_DATASET,
+        {
+            'originating_centre': [HC_ORIGINATING_CENTRE],
+            'system': [HC_SYSTEM],
+            'variable': ['total_precipitation'],
+            'product_type': ['monthly_mean'],
+            'year': HC_CLIMATOLOGY_YEARS,
+            'month': [hc_month],
+            'leadtime_month': ['1', '2', '3'],
+            'data_format': 'grib',
+            'area': [DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LAT_MIN, DOMAIN_LON_MAX],
+        },
+        hc_file,
+    )
+    print(f'Downloaded: {hc_file}')
+
+print('\nHindcast done!')
+
+FC3_ORIGINATING_CENTRE = 'ecmwf'
+FC3_SYSTEM = '51'
+FC3_YEAR   = '2014'   # ← change as needed
+FC3_MONTH  = '12'     # ← change as needed
+
+fc3_file = PAM_SAVE_DIR + f'/{FC3_ORIGINATING_CENTRE}_{FC3_SYSTEM}_{FC3_YEAR}_{FC3_MONTH}_3.grib'
+
+if os.path.exists(fc3_file):
+    print(f'Already exists, skipping: {fc3_file}')
+else:
+    print(f'Downloading 3-month outlook: {FC3_YEAR}/{FC3_MONTH}...')
+    c_cds.retrieve(
+        PAM_DATASET,
+        {
+            'originating_centre': [FC3_ORIGINATING_CENTRE],
+            'system': [FC3_SYSTEM],
+            'variable': ['total_precipitation'],
+            'product_type': ['monthly_mean'],
+            'year': [FC3_YEAR],
+            'month': [FC3_MONTH],
+            'leadtime_month': ['1', '2', '3'],
+            'data_format': 'grib',
+            'area': [DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LAT_MIN, DOMAIN_LON_MAX],
+        },
+        fc3_file,
+    )
+    print(f'Downloaded: {fc3_file}')
+
+def transform_probability(hc_file, fc_file, out_prefix, label):
+    """Calculate Probability of Above-Median (PAM) from hindcast and forecast GRIB files."""
+    print(f'\nProcessing {label}...')
+
+    for path, name in [(hc_file, 'Hindcast'), (fc_file, 'Forecast')]:
+        if not os.path.exists(path):
+            print(f'{name} file missing, skipping: {path}')
+            return None
+
+    ds_hc = xr.open_dataset(hc_file, engine='cfgrib')
+    ds_fc = xr.open_dataset(fc_file, engine='cfgrib')
+    tp_var = list(ds_hc.data_vars)[0]
+
+    hc_median = ds_hc[tp_var].median(dim=['time', 'number'])
+    fc_da     = ds_fc[tp_var]
+
+    # Restore 'step' as a real dimension if collapsed to scalar
+    if 'step' not in fc_da.dims:
+        fc_da = fc_da.expand_dims('step')
+    if 'step' not in hc_median.dims:
+        hc_median = hc_median.expand_dims('step')
+
+    common_steps = np.intersect1d(fc_da.step.values, hc_median.step.values)
+    fc_aligned   = fc_da.sel(step=common_steps)
+    hc_aligned   = hc_median.sel(step=common_steps)
+
+    prob_above_median = (
+        (fc_aligned > hc_aligned)
+        .mean(dim=[d for d in fc_aligned.dims if d not in ['step', 'latitude', 'longitude']])
+        * 100
+    )
+    prob_plot = prob_above_median.mean(dim='step').clip(min=0, max=100)
+
+    prob_file = PAM_SAVE_DIR + f'/prob_above_median_{out_prefix}.nc'
+    # Remove existing file to avoid permission errors on re-run
+    if os.path.exists(prob_file):
+        os.remove(prob_file)
+    prob_above_median.to_netcdf(prob_file)
+    print(f'Saved probability: {prob_file}')
+
+    prob_plot_file = PAM_SAVE_DIR + f'/prob_plot_{out_prefix}.nc'
+    if os.path.exists(prob_plot_file):
+        os.remove(prob_plot_file)
+    prob_plot.to_netcdf(prob_plot_file)
+    print(f'Saved prob plot: {prob_plot_file}')
+
+    return prob_plot_file
+
+  hc_file_for_fc3 = PAM_SAVE_DIR + f'/hc_{HC_ORIGINATING_CENTRE}_{HC_SYSTEM}_1993_2016_{FC3_MONTH}_INDO.grib'
+
+prob_plot_file = transform_probability(
+    hc_file_for_fc3, fc3_file,
+    out_prefix=f'{FC3_ORIGINATING_CENTRE}_{FC3_SYSTEM}_{FC3_YEAR}_{FC3_MONTH}_3_INDO',
+    label=f'3-month outlook {FC3_YEAR}/{FC3_MONTH}'
+)
+
+# temperature anomaly download and transformation
+
+DATASET           = 'seasonal-monthly-single-levels'
+HC_CENTRE         = 'ecmwf'
+HC_SYSTEM         = '51'
+HC_CLIM_YEARS     = ['X']   # ← add year
+HC_MONTHS         = ['X']   # ← add month
+
+# ECMWF SEAS5 is burst-mode (not lagged-start) — keep False unless switching centre
+LAGGED       = False
+ST_DIM_NAME  = 'indexing_time' if LAGGED else 'time'
+
+print(f'Hindcast climatology: {HC_CLIM_YEARS[0]}–{HC_CLIM_YEARS[-1]}')
+print(f'Hindcast init months: {HC_MONTHS}')
+
+for hc_month in HC_MONTHS:
+    hc_file = SAVE_DIR + f'/hc_{HC_CENTRE}_{HC_SYSTEM}_1993_2016_{hc_month}_temp.grib'
+    if os.path.exists(hc_file):
+        print(f'Already exists, skipping: {hc_file}')
+        continue
+    print(f'Downloading hindcast for month {hc_month}...')
+    c_cds.retrieve(
+        DATASET,
+        {
+            'originating_centre': [HC_CENTRE],
+            'system':             [HC_SYSTEM],
+            'variable':           ['2m_temperature'],
+            'product_type':       ['monthly_mean'],
+            'year':               HC_CLIM_YEARS,
+            'month':              [hc_month],
+            'leadtime_month':     ['1', '2', '3'],
+            'data_format':        'grib',
+            'area': [DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LAT_MIN, DOMAIN_LON_MAX],
+        },
+        hc_file,
+    )
+    print(f'Downloaded: {hc_file}')
+
+print('\nHindcast done!')
+
+import itertools
+
+DATASET   = 'seasonal-monthly-single-levels'
+FC_CENTRE = 'ecmwf'
+FC_SYSTEM = '51'
+SAVE_DIR  = '/Users/sashaedney/Downloads/Notebooks/ECMWF/51'
+
+YEARS  = #edit to desired year
+MONTHS = #edit to desired month
+
+for year, month in itertools.product(YEARS, MONTHS):
+    fc_file = SAVE_DIR + f'/{FC_CENTRE}_{FC_SYSTEM}_{year}_{month}_temp.grib'
+    if os.path.exists(fc_file):
+        print(f'Already exists, skipping: {year}/{month}')
+        continue
+    print(f'Downloading forecast: {year}/{month}...')
+    c_cds.retrieve(
+        DATASET,
+        {
+            'originating_centre': [FC_CENTRE],
+            'system':             [FC_SYSTEM],
+            'variable':           ['2m_temperature'],
+            'product_type':       ['monthly_mean'],
+            'year':               [year],
+            'month':              [month],
+            'leadtime_month':     ['1', '2', '3'],
+            'data_format':        'grib',
+            'area':               [12, 95, -12, 156],
+        },
+        fc_file,
+    )
+    print(f'Downloaded: {fc_file}')
+
+print('\nAll temperature forecast downloads complete.')
+
+# ── Load hindcast ────────────────────────────────────────────────────
+hc_path = SAVE_DIR + f'/hc_{HC_CENTRE}_{HC_SYSTEM}_1993_2016_{FC_MONTH}_temp.grib'
+hcst = xr.open_dataarray(
+    hc_path, engine='cfgrib',
+    backend_kwargs=dict(time_dims=('forecastMonth', ST_DIM_NAME))
+)
+hcst = hcst.rename({ST_DIM_NAME: 'start_date', 'longitude': 'lon', 'latitude': 'lat'})
+hcst = hcst.assign_coords(lon=(((hcst.lon + 180) % 360) - 180)).sortby('lon')
+
+# ── Load forecast ────────────────────────────────────────────────────
+fcst = xr.open_dataarray(
+    fc_file, engine='cfgrib',
+    backend_kwargs=dict(time_dims=('forecastMonth', ST_DIM_NAME))
+)
+fcst = fcst.rename({ST_DIM_NAME: 'start_date', 'longitude': 'lon', 'latitude': 'lat'})
+fcst = fcst.assign_coords(lon=(((fcst.lon + 180) % 360) - 180)).sortby('lon')
+
+# ── Compute valid time ───────────────────────────────────────────────
+valid_time = [
+    pd.to_datetime(fcst.start_date.values) + relativedelta(months=fcmonth - 1)
+    for fcmonth in fcst.forecastMonth.values
+]
+fcst = fcst.assign_coords(valid_time=('forecastMonth', valid_time))
+
+print('Hindcast shape:', hcst.shape)
+print('Forecast shape:', fcst.shape)
+
+# ── Climatological mean and anomalies ────────────────────────────────
+# Hindcast climatology: mean over all start years and ensemble members
+hcst_clim     = hcst.mean(['start_date', 'number'])
+
+# Anomalies: difference from climatological mean, then average over ensemble
+hcst_anom_mean = (hcst - hcst_clim).mean('number')
+fcst_anom_mean = (fcst - hcst_clim).mean('number')
+
+# ── Standardised Temperature Index (STI) ────────────────────────────
+# Hindcast std captures both interannual and ensemble spread,
+# analogous to how SPI/SPEI standardise against a historical distribution
+hcst_std = hcst.std(['start_date', 'number'])
+hcst_sti = hcst_anom_mean / hcst_std
+fcst_sti = fcst_anom_mean / hcst_std
+
+print('Anomaly range (°C):', float(fcst_anom_mean.min()), 'to', float(fcst_anom_mean.max()))
+print('STI range (σ):     ', float(fcst_sti.min()),      'to', float(fcst_sti.max()))
+
+save_name = '_'.join([FC_CENTRE, FC_SYSTEM, FC_YEAR, FC_MONTH, 'ensmean_anom.nc'])
+save_full = os.path.join(DATA_PATH, save_name)
+
+# Remove existing file to avoid permission errors on re-run
+if os.path.exists(save_full):
+    os.remove(save_full)
+
+fcst_anom_mean.to_netcdf(save_full)
+print(f'Saved anomaly: {save_full}')
+
+
+
+#DEVELOPMENT OF RISK STATUS MAP
+
+# ── Load datasets ────────────────────────────────────────────────────
+ds_spei = xr.open_dataset(spei_path)
+ds_vhi  = xr.open_dataset(vhi_path)
+ds_prob = xr.open_dataset(prob_path)
+ds_temp = xr.open_dataset(TEMP_ANOM_PATH)
+
+spei_var = list(ds_spei.data_vars)[0]   # read variable name dynamically
+spei = ds_spei[spei_var].squeeze('time', drop=True)
+vhi  = ds_vhi['vhi'].squeeze('time', drop=True)
+
+prob = ds_prob['tprate'].rename('prob_above_median')
+rename_map = {}
+if 'latitude' in prob.coords and 'lat' not in prob.coords:
+    rename_map['latitude'] = 'lat'
+if 'longitude' in prob.coords and 'lon' not in prob.coords:
+    rename_map['longitude'] = 'lon'
+if rename_map:
+    prob = prob.rename(rename_map)
+
+# ── Standardise temperature anomaly ─────────────────────────────────
+temp_var  = list(ds_temp.data_vars)[0]
+temp_anom = ds_temp[temp_var].rename('temp_anom')
+if 'time' in temp_anom.dims and temp_anom.sizes.get('time') == 1:
+    temp_anom = temp_anom.squeeze('time', drop=True)
+if 'forecastMonth' in temp_anom.dims:
+    print('Available forecastMonth values:', temp_anom['forecastMonth'].values)
+    temp_anom = temp_anom.sel(forecastMonth=3)
+rename_map = {}
+if 'latitude' in temp_anom.coords and 'lat' not in temp_anom.coords:
+    rename_map['latitude'] = 'lat'
+if 'longitude' in temp_anom.coords and 'lon' not in temp_anom.coords:
+    rename_map['longitude'] = 'lon'
+if rename_map:
+    temp_anom = temp_anom.rename(rename_map)
+
+print('SPEI variable used:', spei_var)
+for name, da in [('SPEI', spei), ('VHI', vhi), ('PAM', prob), ('Temp', temp_anom)]:
+    print(f'{name} lat direction:', 'descending' if da.lat.values[0] > da.lat.values[-1] else 'ascending')
+
+# ── Clip to domain ───────────────────────────────────────────────────
+def clip_lat_lon(da, lat_min, lat_max, lon_min, lon_max):
+    lat_slice = (slice(lat_max, lat_min) if da.lat.values[0] > da.lat.values[-1]
+                 else slice(lat_min, lat_max))
+    return da.sel(lat=lat_slice, lon=slice(lon_min, lon_max))
+
+spei_c     = clip_lat_lon(spei,     DOMAIN_LAT_MIN, DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LON_MAX)
+vhi_c      = clip_lat_lon(vhi,      DOMAIN_LAT_MIN, DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LON_MAX)
+prob_c     = clip_lat_lon(prob,     DOMAIN_LAT_MIN, DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LON_MAX)
+temp_anom_c = clip_lat_lon(temp_anom, DOMAIN_LAT_MIN, DOMAIN_LAT_MAX, DOMAIN_LON_MIN, DOMAIN_LON_MAX)
+
+for name, da in [('spei_c', spei_c), ('vhi_c', vhi_c), ('prob_c', prob_c), ('temp_anom_c', temp_anom_c)]:
+    assert da.size, f'{name} is empty — check domain/coords before continuing.'
+    print(f'{name}: {da.shape}')
+
+# ── Interpolate onto VHI grid ────────────────────────────────────────
+spei_r      = spei_c.interp_like(vhi_c, method='nearest')
+prob_r      = prob_c.interp_like(vhi_c, method='nearest')
+temp_anom_r = temp_anom_c.interp_like(vhi_c, method='nearest')
+
+# ── Decision rule classification ─────────────────────────────────────
+# Confirm thresholds with supervisors before relying on this output
+TEMP_THRESHOLD = 1.0  
+TEMP_WEIGHT = 0.75
+
+land_mask = vhi_c.notnull()   # VHI masks ocean
+
+cond_spei = spei_r < -1
+cond_vhi  = vhi_c  < 40
+cond_prob = prob_r < 40
+cond_temp = temp_anom_r > TEMP_THRESHOLD
+
+# Weighted score — primary indicators count 1.0, temperature counts 0.75
+score = (
+    cond_spei.astype(int)
+    + cond_vhi.astype(int)
+    + cond_prob.astype(int)
+    + cond_temp.astype(float) * TEMP_WEIGHT
+)
+
+condD = spei_r.notnull()                                      # data present, no signal
+condC = cond_spei | cond_vhi | cond_prob | cond_temp          # Watch: any one indicator
+condB = (cond_spei | cond_vhi) & (cond_prob | cond_temp)      # Alert: one monitoring AND one forecasting/thermal
+condA = cond_spei & cond_vhi & (cond_prob | cond_temp)          # Emergency: both monitoring AND on forecasting agree
+
+classified = xr.full_like(vhi_c, np.nan, dtype=float)
+classified = xr.where(condD, 1, classified)
+classified = xr.where(condC, 2, classified)
+classified = xr.where(condB, 3, classified)
+classified = xr.where(condA, 4, classified)
+classified = classified.where(land_mask)
+classified.name = 'risk_class'
+
+#drought risk map with scale bar
+import matplotlib.patheffects as pe
+
+def add_scale_bar(ax, length_km=500, label='500 km', x0_frac=0.05, y0_frac=0.05, ref_lat=-6.0):
+    """Add a scale bar to a cartopy map axis."""
+    # Convert km to degrees longitude at the reference latitude
+    km_per_deg_lon = 111.32 * np.cos(np.radians(ref_lat))
+    length_deg     = length_km / km_per_deg_lon
+
+    # Get axis extent in data coordinates
+    x0_data, x1_data, y0_data, y1_data = ax.get_extent(ccrs.PlateCarree())
+    x_range = x1_data - x0_data
+    y_range = y1_data - y0_data
+
+    # Position of scale bar start
+    x0 = x0_data + x0_frac * x_range
+    y0 = y0_data + y0_frac * y_range
+
+    # Draw the scale bar line
+    ax.plot(
+        [x0, x0 + length_deg], [y0, y0],
+        color='black', linewidth=2.5,
+        transform=ccrs.PlateCarree(), zorder=10
+    )
+    # End ticks
+    tick_h = y_range * 0.008
+    for x in [x0, x0 + length_deg]:
+        ax.plot(
+            [x, x], [y0 - tick_h, y0 + tick_h],
+            color='black', linewidth=2.5,
+            transform=ccrs.PlateCarree(), zorder=10
+        )
+    # Label
+    ax.text(
+        x0 + length_deg / 2, y0 + y_range * 0.018,
+        label,
+        ha='center', va='bottom', fontsize=9,
+        transform=ccrs.PlateCarree(), zorder=10,
+        path_effects=[pe.withStroke(linewidth=2, foreground='white')]
+    )
+
+# ── Plot: Drought Risk Status Map ─────────────────────────────────────
+cmap   = mcolors.ListedColormap(['#d3d3d3', '#ffdd00', '#ff8c00', '#d62728'])
+bounds = [0.5, 1.5, 2.5, 3.5, 4.5]
+norm   = mcolors.BoundaryNorm(bounds, cmap.N)
+
+fig, ax = plt.subplots(figsize=(12, 7), subplot_kw={'projection': ccrs.PlateCarree()})
+im = classified.plot(
+    ax=ax, transform=ccrs.PlateCarree(),
+    cmap=cmap, norm=norm, add_colorbar=False
+)
+ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+ax.set_extent([DOMAIN_LON_MIN, DOMAIN_LON_MAX, DOMAIN_LAT_MIN, DOMAIN_LAT_MAX],
+              crs=ccrs.PlateCarree())
+
+gl = ax.gridlines(
+    crs=ccrs.PlateCarree(),
+    draw_labels=True,
+    linewidth=0.5,
+    color='gray',
+    alpha=0.5,
+    linestyle='--'
+)
+gl.top_labels   = False
+gl.right_labels = False
+gl.xlocator = plt.FixedLocator(range(95, 160, 10))
+gl.ylocator = plt.FixedLocator(range(-12, 13, 4))
+gl.xlabel_style = {'size': 9}
+gl.ylabel_style = {'size': 9}
+
+# ── Scale bar ─────────────────────────────────────────────────────────
+add_scale_bar(ax, length_km=500, label='500 km',
+              x0_frac=0.05, y0_frac=0.04, ref_lat=-6.0)
+
+ax.set_title(f'Drought Risk Status Map — September 2026', fontsize=13)
+
+cbar = fig.colorbar(im, ax=ax, ticks=[1, 2, 3, 4],
+                    shrink=0.7, orientation='horizontal', pad=0.08)
+cbar.ax.set_xticklabels(['Low Drought Risk', 'Drought Watch',
+                         'Drought Alert', 'Drought Critical'])
+
+plt.tight_layout()
+plt.savefig(plot_path + f'/risk_map_{TARGET_YEAR}{TARGET_MONTH}.png',
+            dpi=200, bbox_inches='tight')
+plt.show()
+
