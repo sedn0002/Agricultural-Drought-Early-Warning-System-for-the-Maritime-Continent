@@ -2,6 +2,7 @@
 # DROUGHT RISK MAP DEVELOPMENT 375-560
 
 import os
+import pandas as pd
 import zipfile
 import warnings
 import requests
@@ -23,7 +24,7 @@ warnings.filterwarnings('ignore')
 DOMAIN_LAT_MIN, DOMAIN_LAT_MAX = -12, 12
 DOMAIN_LON_MIN, DOMAIN_LON_MAX = 95, 156
 
-PROJECT_ROOT = #fill with individual project path. 
+PROJECT_ROOT = os.getcwd()
 PAM_SAVE_DIR = PROJECT_ROOT + '/ecmwf/51'
 os.makedirs(PAM_SAVE_DIR, exist_ok=True)
 
@@ -36,7 +37,7 @@ c_cds = cdsapi.Client()
 # Section 1 — VHI download (NOAA)
 
 VHI_BASE_URL  = 'https://ftp.cpc.ncep.noaa.gov/precip/PORT/SEMDP/VEGETATION-INDEX/VHI/DATA/'
-VHI_YEARS     =  # ← change year(s) as needed
+VHI_YEARS     =  [2026] # ← change year(s) as needed
 VHI_FILE_FILTER = '0.10deg-MON'
 VHI_SAVE_DIR  = PROJECT_ROOT + '/RiskMap/VHI'
 os.makedirs(VHI_SAVE_DIR, exist_ok=True)
@@ -84,8 +85,8 @@ print(f'\nVHI done — {vhi_total} files processed.')
 
 SPEI_DATASET  = 'derived-drought-historical-monthly'
 SPEI_ACCUM    = '3'           # '1' or '3' month accumulation
-SPEI_YEARS    = ['#']      # ← change as needed
-SPEI_MONTHS   = ['#']        # ← change as needed
+SPEI_YEARS    = ['2026']      # ← change as needed
+SPEI_MONTHS   = ['08']        # ← change as needed
 SPEI_SAVE_DIR = PROJECT_ROOT + '/RiskMap/SPEI'
 os.makedirs(SPEI_SAVE_DIR, exist_ok=True)
 
@@ -131,7 +132,7 @@ PAM_DATASET           = 'seasonal-monthly-single-levels'
 HC_ORIGINATING_CENTRE = 'ecmwf'
 HC_SYSTEM             = '51'
 HC_CLIMATOLOGY_YEARS  = [str(y) for y in range(1993, 2017)]
-HC_MONTHS             = ['#']   # ← add whichever init months you need
+HC_MONTHS             = ['08']   # ← add whichever init months you need
 
 print(f'Hindcast climatology: {HC_CLIMATOLOGY_YEARS[0]}–{HC_CLIMATOLOGY_YEARS[-1]}')
 print(f'Hindcast init months: {HC_MONTHS}')
@@ -163,8 +164,8 @@ print('\nHindcast done!')
 
 FC3_ORIGINATING_CENTRE = 'ecmwf'
 FC3_SYSTEM = '51'
-FC3_YEAR   = '2014'   # ← change as needed
-FC3_MONTH  = '12'     # ← change as needed
+FC3_YEAR   = '2026'   # ← change as needed
+FC3_MONTH  = '08'     # ← change as needed
 
 fc3_file = PAM_SAVE_DIR + f'/{FC3_ORIGINATING_CENTRE}_{FC3_SYSTEM}_{FC3_YEAR}_{FC3_MONTH}_3.grib'
 
@@ -196,7 +197,7 @@ def transform_probability(hc_file, fc_file, out_prefix, label):
     for path, name in [(hc_file, 'Hindcast'), (fc_file, 'Forecast')]:
         if not os.path.exists(path):
             print(f'{name} file missing, skipping: {path}')
-            return None
+            return PAM_SAVE_DIR + f'/prob_above_median_{out_prefix}.nc'
 
     ds_hc = xr.open_dataset(hc_file, engine='cfgrib')
     ds_fc = xr.open_dataset(fc_file, engine='cfgrib')
@@ -237,7 +238,7 @@ def transform_probability(hc_file, fc_file, out_prefix, label):
 
     return prob_plot_file
 
-  hc_file_for_fc3 = PAM_SAVE_DIR + f'/hc_{HC_ORIGINATING_CENTRE}_{HC_SYSTEM}_1993_2016_{FC3_MONTH}_INDO.grib'
+hc_file_for_fc3 = PAM_SAVE_DIR + f'/hc_{HC_ORIGINATING_CENTRE}_{HC_SYSTEM}_1993_2016_{FC3_MONTH}.grib'
 
 prob_plot_file = transform_probability(
     hc_file_for_fc3, fc3_file,
@@ -250,12 +251,14 @@ prob_plot_file = transform_probability(
 DATASET           = 'seasonal-monthly-single-levels'
 HC_CENTRE         = 'ecmwf'
 HC_SYSTEM         = '51'
-HC_CLIM_YEARS     = ['X']   # ← add year
-HC_MONTHS         = ['X']   # ← add month
+HC_CLIM_YEARS     = ['2026']   # ← add year
+HC_MONTHS         = ['08']   # ← add month
 
 # ECMWF SEAS5 is burst-mode (not lagged-start) — keep False unless switching centre
 LAGGED       = False
 ST_DIM_NAME  = 'indexing_time' if LAGGED else 'time'
+
+SAVE_DIR = os.path.abspath(os.curdir)
 
 print(f'Hindcast climatology: {HC_CLIM_YEARS[0]}–{HC_CLIM_YEARS[-1]}')
 print(f'Hindcast init months: {HC_MONTHS}')
@@ -290,10 +293,10 @@ import itertools
 DATASET   = 'seasonal-monthly-single-levels'
 FC_CENTRE = 'ecmwf'
 FC_SYSTEM = '51'
-SAVE_DIR  = '/Users/sashaedney/Downloads/Notebooks/ECMWF/51'
+SAVE_DIR = os.path.abspath(os.curdir)
 
-YEARS  = #edit to desired year
-MONTHS = #edit to desired month
+YEARS  = ['2026']
+MONTHS = ['08']
 
 for year, month in itertools.product(YEARS, MONTHS):
     fc_file = SAVE_DIR + f'/{FC_CENTRE}_{FC_SYSTEM}_{year}_{month}_temp.grib'
@@ -320,12 +323,15 @@ for year, month in itertools.product(YEARS, MONTHS):
 
 print('\nAll temperature forecast downloads complete.')
 
+FC_MONTH = MONTHS[0]
+FC_YEAR = YEARS[0]
 # ── Load hindcast ────────────────────────────────────────────────────
 hc_path = SAVE_DIR + f'/hc_{HC_CENTRE}_{HC_SYSTEM}_1993_2016_{FC_MONTH}_temp.grib'
 hcst = xr.open_dataarray(
     hc_path, engine='cfgrib',
     backend_kwargs=dict(time_dims=('forecastMonth', ST_DIM_NAME))
 )
+print(hcst)
 hcst = hcst.rename({ST_DIM_NAME: 'start_date', 'longitude': 'lon', 'latitude': 'lat'})
 hcst = hcst.assign_coords(lon=(((hcst.lon + 180) % 360) - 180)).sortby('lon')
 
@@ -349,6 +355,8 @@ print('Forecast shape:', fcst.shape)
 
 # ── Climatological mean and anomalies ────────────────────────────────
 # Hindcast climatology: mean over all start years and ensemble members
+if 'start_date' not in fcst.dims:
+    hcst = fcst.expand_dims('start_date')
 hcst_clim     = hcst.mean(['start_date', 'number'])
 
 # Anomalies: difference from climatological mean, then average over ensemble
@@ -366,7 +374,7 @@ print('Anomaly range (°C):', float(fcst_anom_mean.min()), 'to', float(fcst_anom
 print('STI range (σ):     ', float(fcst_sti.min()),      'to', float(fcst_sti.max()))
 
 save_name = '_'.join([FC_CENTRE, FC_SYSTEM, FC_YEAR, FC_MONTH, 'ensmean_anom.nc'])
-save_full = os.path.join(DATA_PATH, save_name)
+save_full = os.path.join(os.getcwd(), save_name)
 
 # Remove existing file to avoid permission errors on re-run
 if os.path.exists(save_full):
@@ -380,6 +388,32 @@ print(f'Saved anomaly: {save_full}')
 #DEVELOPMENT OF RISK STATUS MAP
 
 # ── Load datasets ────────────────────────────────────────────────────
+TARGET_YEAR       = '2026'   # ← must match SPEI/VHI download year
+TARGET_MONTH      = '08'     # ← must match SPEI/VHI download month
+TARGET_SPEI_ACCUM = '3'      # ← must match SPEI_ACCUM above
+
+import os
+
+spei_dir = f"{PROJECT_ROOT}/RiskMap/SPEI"
+spei_files = [f for f in os.listdir(spei_dir) if os.path.isfile(os.path.join(spei_dir, f))]
+
+if len(spei_files) != 1:
+    raise ValueError(f"Expected exactly one file in {spei_dir}, found {len(spei_files)}: {spei_files}")
+
+spei_path = os.path.join(spei_dir, spei_files[0])
+
+vhi_path  = f"{PROJECT_ROOT}/RiskMap/VHI/SEMDP_VHI_0.10deg-MON_{TARGET_YEAR}{TARGET_MONTH}.nc"
+
+prob_path = prob_plot_file
+
+print(prob_plot_file)
+
+TEMP_ANOM_PATH = f"{PROJECT_ROOT}/ecmwf_51_{TARGET_YEAR}_{TARGET_MONTH}_ensmean_anom.nc"
+
+for label, p in [('SPEI', spei_path), ('VHI', vhi_path), ('PAM', prob_path), ('Temp anomaly', TEMP_ANOM_PATH)]:
+    status = 'FOUND' if (p and os.path.exists(p)) else 'MISSING'
+    print(f'{label}: {status} -> {p}')
+
 ds_spei = xr.open_dataset(spei_path)
 ds_vhi  = xr.open_dataset(vhi_path)
 ds_prob = xr.open_dataset(prob_path)
